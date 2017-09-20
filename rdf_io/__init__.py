@@ -1,3 +1,6 @@
-from . import signals
+try:
+   from django.core import signals
+except:
+    import signals
 
-_version__ = (0, 1)
+__version__ = (0, 1)

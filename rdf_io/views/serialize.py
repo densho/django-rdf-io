@@ -1,10 +1,11 @@
 # # -*- coding:utf-8 -*-
 from django.shortcuts import render_to_response, redirect
-from .models import ObjectMapping,Namespace,AttributeMapping,EmbeddedMapping, ObjectType, getattr_path, apply_pathfilter, expand_curie, dequote
+from rdf_io.models import ObjectMapping,Namespace,AttributeMapping,EmbeddedMapping, ObjectType,ServiceBinding, getattr_path, apply_pathfilter, expand_curie, dequote, push_to_store
+
 from django.template import RequestContext
 from django.contrib.contenttypes.models import ContentType
 from django.conf import settings
-from string import Formatter
+
 from rdflib import BNode
 # TODO make python 3 safe!
 import urllib as u
@@ -149,15 +150,17 @@ def pub_rdf(request,model,id):
     # ok so object exists and is mappable, better get down to it..
 
     try:
-        rdfstore = _get_rdfstore(model,name=request.GET.get('rdfstore') )
+        rdfstore = get_rdfstore(model,name=request.GET.get('rdfstore') )
     except:
         return  HttpResponse("RDF store not configured", status=410 )
     
-    result = publish(obj, model, oml,rdfstore)
-
+    try:
+        result = publish(obj, model, oml,rdfstore)
+    except Exception as e:
+        return HttpResponse("Exception publishing remote RDF content %s" % e,status=500 )
     return HttpResponse("Server reports %s" % result.content,status=result.status_code )
     
-def _get_rdfstore(model, name=None ):
+def get_rdfstore(model, name=None ):
     # now get the remote store mappings 
     
     if name :
@@ -183,9 +186,7 @@ def _get_rdfstore(model, name=None ):
     
 def publish(obj, model, oml, rdfstore ):
       
-    if not rdfstore:
-        rdfstore = _get_rdfstore(model,None)
-        
+       
     gr = Graph()
 #    import pdb; pdb.set_trace()
 #    ns_mgr = NamespaceManager(Graph())
@@ -193,75 +194,15 @@ def publish(obj, model, oml, rdfstore ):
     try:
         gr = build_rdf(gr, obj, oml, False)
     except Exception as e:
-        return  HttpResponse("Error during serialisation: " + str(e) , status=500 )
+        raise Exception("Error during serialisation: " + str(e) )
     for ns in _nslist.keys() :
         gr.namespace_manager.bind( str(ns), namespace.Namespace(str(_nslist[ns])), override=False)
     
 #    curl -X POST -H "Content-Type: text/turtle" -d @- http://192.168.56.151:8080/marmotta/import/upload?context=http://mapstory.org/def/featuretypes/gazetteer 
-    resttgt = "".join( ( rdfstore['server'],_resolveTemplate(rdfstore['target'], model, obj ) ))  
+    
+    
+    return push_to_store( None, model, obj, gr )
 
-    if rdfstore['server_api'] == "RDF4JREST" :
-        return _rdf4j_push(rdfstore, resttgt, model, obj, gr )
-    elif rdfstore['server_api'] == "LDP" :
-        return _ldp_push(rdfstore, resttgt, model, obj, gr )
-    else:
-        return  HttpResponse("Unknown server API" , status=500 )
-        
-def _ldp_push(rdfstore, resttgt, model, obj, gr ):
-    etag = _get_etag(resttgt)
-    headers = {'Content-Type': 'text/turtle'} 
-    if etag :
-        headers['If-Match'] = etag
-       
-    for h in rdfstore.get('headers') or [] :
-        headers[h] = _resolveTemplate( rdfstore['headers'][h], model, obj )
-    
-    result = requests.put( resttgt, headers=headers , data=gr.serialize(format="turtle"), auth=rdfstore.get('auth'))
-    #logger.info ( "Updating resource {} {}".format(resttgt,result.status_code) )
-    if result.status_code > 400 :
-#         print "Posting new resource"
-#         result = requests.post( resttgt, headers=headers , data=gr.serialize(format="turtle"))
-        logger.error ( "Failed to publish resource {} {}".format(resttgt,result.status_code) )
-        return HttpResponse ("Failed to publish resource {} {} : {} ".format(resttgt,result.status_code, result.content) , status = result.status_code )
-    return result 
-
-def _get_etag(uri):
-    """
-        Gets the LDP Etag for a resource if it exists
-    """
-    # could put in cache here - but for now just issue a HEAD
-    result = requests.head(uri)
-    return result.headers.get('ETag')
-        
-def _rdf4j_push(rdfstore, resttgt, model, obj, gr ):
-    #import pdb; pdb.set_trace()
-    headers = {'Content-Type': 'application/x-turtle;charset=UTF-8'} 
-  
-    for h in rdfstore.get('headers') or [] :
-        headers[h] = _resolveTemplate( rdfstore['headers'][h], model, obj )
-    
-    result = requests.put( resttgt, headers=headers , data=gr.serialize(format="turtle"))
-    logger.info ( "Updating resource {} {}".format(resttgt,result.status_code) )
-    if result.status_code > 400 :
-#         print "Posting new resource"
-#         result = requests.post( resttgt, headers=headers , data=gr.serialize(format="turtle"))
-        logger.error ( "Failed to publish resource {} {}".format(resttgt,result.status_code) )
-        return HttpResponse ("Failed to publish resource {} {}".format(resttgt,result.status_code) , status = result.status_code )
-    return result 
-
-    
-def _resolveTemplate(template, model, obj) :
-    
-    vals = { 'model' : model }
-    for (literal,param,repval,conv) in Formatter().parse(template) :
-        if param and param != 'model' :
-            try:
-                vals[param] = iter(getattr_path(obj,param)).next()
-            except:
-                if param == 'slug'  :
-                    vals[param] = obj.id
-    
-    return template.format(**vals)
  
    
 def build_rdf( gr,obj, oml, includemembers ) :  
@@ -402,63 +343,3 @@ def _add_vals(gr, obj, subject, predicate, attr, is_resource ) :
                         except:
                             raise ValueError("Value not a convertable type %s" % type(value))
                     gr.add( (subject, _as_resource(gr,predicate) , object) )
-    
-def sync_remote(request,models):
-    """
-        Synchronises the RDF published output for the models, in the order listed (list containers before members!)
-    """
-    if request.GET.get('pdb') :
-        import pdb; pdb.set_trace()
- 
-    for model in models.split(",") :
-        try:
-            (app,model) = model.split('.')
-            ct = ContentType.objects.get(app_label=app,model=model)
-        except:
-            ct = ContentType.objects.get(model=model)
-        if not ct :
-            raise Http404("No such model found")
-
-        try:
-            rdfstore = _get_rdfstore(model,name=request.GET.get('rdfstore') )
-        except:
-            return  HttpResponse("RDF store not configured", status=410 )
-
-        do_sync_remote( model, ct , rdfstore )
-    return HttpResponse("sync successful for {}".format(models), status=200)
-    
-def do_sync_remote(formodel, ct ,rdfstore):
-
-    oml = ObjectMapping.objects.filter(content_type=ct)
-    modelclass = ct.model_class()
-    for obj in modelclass.objects.all() :
-        publish( obj, formodel, oml, rdfstore)
-# gr.add((URIRef('skos:Concept'), RDF.type, URIRef('foaf:Person')))
-# gr.add((URIRef('rdf:Concept'), RDF.type, URIRef('xxx:Person')))
-
-def ctl_signals(request,cmd):
-    """utility view to control and debug signals"""
-    from rdf_io.signals import setup_signals,list_pubs,sync_signals
-    if cmd == 'on':
-        msg = auto_on()
-    elif cmd == 'off' :
-        msg = "not implemented"
-    elif cmd == 'list' :
-        msg = list_pubs()
-    elif cmd == 'sync' :
-        msg = sync_signals()
-    elif cmd == 'help' :
-        msg = "usage /rdf_io/ctl_signals/(on|off|list|sync|help)"
-    else:
-        msg = "Command %s not understood" % cmd
-    return HttpResponse(msg, status=200)
- 
-
-def auto_on():
-    """turn Auto push signals on"""
-    from rdf_io.signals import setup_signals,list_pubs
-    signals.post_save.connect(setup_signals, sender=ObjectMapping)
-    return list_pubs()
-
-    
-    
